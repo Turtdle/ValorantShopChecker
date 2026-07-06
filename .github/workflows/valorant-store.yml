@@ -1,0 +1,35 @@
+name: Valorant Store Check
+
+on:
+  # 01:00 UTC ~= 5pm PST (shifts to ~6pm during PDT; cron doesn't follow DST).
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}
+
+jobs:
+  check-store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install requests
+
+      - name: Fetch store and notify Discord
+        id: store
+        working-directory: scripts
+        env:
+          RIOT_COOKIES: ${{ secrets.RIOT_COOKIES }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          REGION: na
+        run: python ci_check_store.py
+
+      - name: Persist refreshed session cookies
+        if: always() && steps.store.outputs.cookies != ''
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          COOKIES: ${{ steps.store.outputs.cookies }}
+        run: gh secret set RIOT_COOKIES --body "$COOKIES"
