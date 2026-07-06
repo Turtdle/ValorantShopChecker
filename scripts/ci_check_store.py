@@ -45,16 +45,38 @@ def write_github_output(name: str, value: str) -> None:
 
 
 def main():
-    cookies_json = os.environ.get("RIOT_COOKIES")
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+    cookies_json = (os.environ.get("RIOT_COOKIES") or "").strip()
+    webhook_url = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
     region = os.environ.get("REGION", "na")
 
-    if not cookies_json or not webhook_url:
-        print("RIOT_COOKIES and DISCORD_WEBHOOK_URL must both be set.", file=sys.stderr)
+    if not webhook_url:
+        print("DISCORD_WEBHOOK_URL secret is missing or empty.", file=sys.stderr)
+        sys.exit(1)
+
+    if not cookies_json:
+        msg = (
+            "⚠️ Valorant store check: the RIOT_COOKIES secret is empty. Run "
+            "`python scripts/bootstrap_cookies.py` locally, then paste the JSON it "
+            "prints into the RIOT_COOKIES repo secret."
+        )
+        print(msg, file=sys.stderr)
+        post_to_discord(webhook_url, msg)
+        sys.exit(1)
+
+    try:
+        cookies = json.loads(cookies_json)
+    except json.JSONDecodeError:
+        msg = (
+            "⚠️ Valorant store check: the RIOT_COOKIES secret isn't valid JSON. It "
+            "must be the exact JSON blob printed by `bootstrap_cookies.py`, e.g. "
+            '{"ssid": "...", "tdid": "..."} — with no extra quotes or line breaks.'
+        )
+        print(msg, file=sys.stderr)
+        post_to_discord(webhook_url, msg)
         sys.exit(1)
 
     session = requests.Session()
-    cookies_from_dict(session, json.loads(cookies_json))
+    cookies_from_dict(session, cookies)
 
     access_token = reauth_with_cookies(session)
     if access_token is None:
