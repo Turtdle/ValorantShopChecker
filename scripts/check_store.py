@@ -25,7 +25,16 @@ import getpass
 
 import requests
 
-from valorant_auth import AUTHORIZE_URL, AuthError, extract_access_token, fetch_store, format_store_lines, login
+from valorant_auth import (
+    AUTHORIZE_URL,
+    AuthError,
+    extract_access_token,
+    fetch_competitive,
+    fetch_store,
+    format_rank_lines,
+    format_store_lines,
+    login,
+)
 
 
 def main():
@@ -56,11 +65,14 @@ def main():
                 access_token = login(session, username, password)
 
         store = fetch_store(session, access_token, args.region)
+        comp = fetch_competitive(session, access_token, args.region)
     except AuthError as e:
         raise SystemExit(str(e))
 
     print()
     print("\n".join(format_store_lines(store)))
+    print()
+    print("\n".join(format_rank_lines(comp)))
 
 
 if __name__ == "__main__":
