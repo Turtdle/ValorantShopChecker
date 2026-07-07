@@ -31,7 +31,8 @@ from valorant_auth import (
     competitive_updates,
     compute_match_stats,
     extract_access_token,
-    format_rank_lines,
+    format_current_rank_line,
+    format_recent_matches_lines,
     format_season_stats_lines,
     format_store_lines,
     game_headers,
@@ -87,7 +88,9 @@ def main():
     print()
     print("\n".join(format_store_lines(store)))
     print()
-    print("\n".join(format_rank_lines(updates)))
+    print(format_current_rank_line(updates))
+    print()
+    print("\n".join(format_recent_matches_lines(stats["per_match"])))
     print()
     print("\n".join(format_season_stats_lines(stats)))
 
