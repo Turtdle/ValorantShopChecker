@@ -37,6 +37,7 @@ from valorant_auth import (
     game_headers,
     get_current_act,
     login,
+    paged_competitive_matches,
     store_front,
 )
 
@@ -52,7 +53,13 @@ def main():
         "--kd-matches",
         type=int,
         default=15,
-        help="How many recent ranked matches to sample for the average K/D (default 15).",
+        help="How many recent ranked matches to sample for winrate/K/D (default 15).",
+    )
+    parser.add_argument(
+        "--full-act",
+        action="store_true",
+        help="Compute winrate/K/D over EVERY ranked game this act (slower, one API "
+        "call per game; may hit Riot rate limits). Overrides --kd-matches.",
     )
     args = parser.parse_args()
 
@@ -83,9 +90,18 @@ def main():
             session, headers, puuid, args.region, count=max(args.kd_matches, 5)
         )
         _, act_start = get_current_act()
-        print("\nSampling recent matches for winrate + K/D... (this can take a few seconds)")
+        if args.full_act:
+            matches = paged_competitive_matches(session, headers, puuid, args.region, act_start)
+            print(f"\nComputing winrate + K/D over all {len(matches)} ranked games this act...")
+        else:
+            matches = [
+                m
+                for m in (updates.get("Matches") or [])
+                if not act_start or m.get("MatchStartTime", 0) >= act_start
+            ][: args.kd_matches]
+            print("\nSampling recent matches for winrate + K/D... (this can take a few seconds)")
         stats = compute_match_stats(
-            session, headers, puuid, args.region, updates, act_start, sample=args.kd_matches
+            session, headers, puuid, args.region, matches, progress=args.full_act
         )
     except AuthError as e:
         raise SystemExit(str(e))

@@ -6,6 +6,7 @@ cookie-based refresh for the GitHub Action).
 """
 import datetime as _dt
 import re
+import time
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -221,35 +222,76 @@ def get_current_act() -> tuple:
     return None, None
 
 
+def paged_competitive_matches(
+    session: requests.Session,
+    headers: dict,
+    puuid: str,
+    region: str,
+    act_start_millis,
+    hard_cap: int = 300,
+) -> list:
+    """Pages competitiveupdates to collect every ranked match in the current act.
+
+    Riot allows at most 20 entries per request, so this walks the history 20 at
+    a time and stops once matches predate the act (or the history runs out).
+    """
+    collected = []
+    start = 0
+    while start < hard_cap:
+        end = start + 20
+        url = (
+            f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitiveupdates"
+            f"?startIndex={start}&endIndex={end}&queue=competitive"
+        )
+        try:
+            batch = checked_json(session.get(url, headers=headers), "competitive updates").get(
+                "Matches"
+            ) or []
+        except AuthError:
+            break
+        if not batch:
+            break
+        for m in batch:
+            if act_start_millis and m.get("MatchStartTime", 0) < act_start_millis:
+                return collected  # reached the previous act; done
+            collected.append(m)
+        start = end
+    return collected
+
+
 def compute_match_stats(
     session: requests.Session,
     headers: dict,
     puuid: str,
     region: str,
-    updates: dict,
-    act_start_millis,
-    sample: int = 15,
+    matches: list,
+    progress: bool = False,
 ) -> dict:
-    """Winrate + average K/D over the player's most recent ranked matches this act.
+    """Winrate + average K/D over the given ranked matches.
 
-    Fetches per-match details for up to `sample` games and reads both the K/D
-    (from the player's stats) and win/loss (from the player's team) out of the
-    same responses, so both figures cover exactly the same set of games.
+    Fetches per-match details for each game and reads both the K/D (from the
+    player's stats) and win/loss (from the player's team) out of the same
+    responses, so both figures cover exactly the same set of games. A failed
+    fetch (e.g. a rate limit) is retried once with a short backoff, then skipped.
     """
-    matches = updates.get("Matches") or []
-    if act_start_millis:
-        matches = [m for m in matches if m.get("MatchStartTime", 0) >= act_start_millis]
-    matches = matches[:sample]
-
     kills = deaths = counted = wins = losses = draws = 0
-    for m in matches:
+    total = len(matches)
+    for i, m in enumerate(matches, 1):
         match_id = m.get("MatchID")
         if not match_id:
             continue
-        try:
-            details = match_details(session, headers, region, match_id)
-        except AuthError:
-            continue  # skip a match that errors (e.g. rate limit) rather than aborting
+        if progress:
+            print(f"  fetching match {i}/{total}...", end="\r", flush=True)
+        details = None
+        for attempt in range(2):
+            try:
+                details = match_details(session, headers, region, match_id)
+                break
+            except AuthError:
+                if attempt == 0:
+                    time.sleep(2)  # brief backoff, likely a transient rate limit
+        if details is None:
+            continue  # skip a match that keeps erroring rather than aborting
         me = next((p for p in details.get("players", []) if p.get("subject") == puuid), None)
         if not me:
             continue
@@ -273,6 +315,9 @@ def compute_match_stats(
             else:
                 losses += 1
 
+    if progress and total:
+        print(" " * 40, end="\r")  # clear the progress line
+
     kd = (kills / deaths) if deaths else float(kills)
     return {
         "kills": kills,
@@ -294,7 +339,7 @@ def format_season_stats_lines(stats: dict) -> list[str]:
         draw_note = f", {stats['draws']}D" if stats["draws"] else ""
         lines.append(
             f"**Winrate**: {wr:.0f}% ({stats['wins']}W / {stats['losses']}L{draw_note} "
-            f"over last {stats['games']} ranked games)"
+            f"over {stats['games']} ranked games this act)"
         )
     else:
         lines.append("**Winrate**: no ranked match data available.")
@@ -302,7 +347,7 @@ def format_season_stats_lines(stats: dict) -> list[str]:
     if stats["games"]:
         lines.append(
             f"**Avg K/D**: {stats['kd']:.2f} "
-            f"({stats['kills']}K / {stats['deaths']}D over last {stats['games']} ranked games)"
+            f"({stats['kills']}K / {stats['deaths']}D over {stats['games']} ranked games this act)"
         )
     else:
         lines.append("**Avg K/D**: no ranked match data available.")
