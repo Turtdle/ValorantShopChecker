@@ -49,18 +49,6 @@ def main():
         "--url",
         help="Paste the full playvalorant.com/opt_in redirect URL here to skip the prompt.",
     )
-    parser.add_argument(
-        "--kd-matches",
-        type=int,
-        default=15,
-        help="How many recent ranked matches to sample for winrate/K/D (default 15).",
-    )
-    parser.add_argument(
-        "--full-act",
-        action="store_true",
-        help="Compute winrate/K/D over EVERY ranked game this act (slower, one API "
-        "call per game; may hit Riot rate limits). Overrides --kd-matches.",
-    )
     args = parser.parse_args()
 
     session = requests.Session()
@@ -85,23 +73,13 @@ def main():
         headers, puuid = game_headers(session, access_token)
         store = store_front(session, headers, puuid, args.region)
 
-        # Pull enough recent updates to cover both the rank readout and the K/D sample.
-        updates = competitive_updates(
-            session, headers, puuid, args.region, count=max(args.kd_matches, 5)
-        )
+        # Recent updates drive the current-rank + last-5-matches readout.
+        updates = competitive_updates(session, headers, puuid, args.region, count=5)
         _, act_start = get_current_act()
-        if args.full_act:
-            matches = paged_competitive_matches(session, headers, puuid, args.region, act_start)
-            print(f"\nComputing winrate + K/D over all {len(matches)} ranked games this act...")
-        else:
-            matches = [
-                m
-                for m in (updates.get("Matches") or [])
-                if not act_start or m.get("MatchStartTime", 0) >= act_start
-            ][: args.kd_matches]
-            print("\nSampling recent matches for winrate + K/D... (this can take a few seconds)")
+        matches = paged_competitive_matches(session, headers, puuid, args.region, act_start)
+        print(f"\nComputing winrate + K/D over all {len(matches)} ranked games this act...")
         stats = compute_match_stats(
-            session, headers, puuid, args.region, matches, progress=args.full_act
+            session, headers, puuid, args.region, matches, progress=True
         )
     except AuthError as e:
         raise SystemExit(str(e))
