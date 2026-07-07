@@ -21,6 +21,8 @@ ENTITLEMENTS_URL = "https://entitlements.auth.riotgames.com/api/token/v1"
 USERINFO_URL = "https://auth.riotgames.com/userinfo"
 VERSION_URL = "https://valorant-api.com/v1/version"
 SKINLEVELS_URL = "https://valorant-api.com/v1/weapons/skinlevels"
+COMPETITIVE_TIERS_URL = "https://valorant-api.com/v1/competitivetiers"
+MAPS_URL = "https://valorant-api.com/v1/maps"
 CLIENT_PLATFORM = (
     "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9T"
     "VmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24i"
@@ -134,8 +136,8 @@ def get_skin_names() -> dict:
         return {}
 
 
-def fetch_store(session: requests.Session, access_token: str, region: str) -> dict:
-    """Given a valid access token, fetches entitlements + puuid + the store."""
+def game_headers(session: requests.Session, access_token: str) -> tuple[dict, str]:
+    """Builds the auth headers for pd.{region} game endpoints. Returns (headers, puuid)."""
     headers = {"Authorization": f"Bearer {access_token}"}
     entitlements_resp = session.post(ENTITLEMENTS_URL, headers=headers, json={})
     entitlements_token = checked_json(entitlements_resp, "entitlements")["entitlements_token"]
@@ -146,11 +148,48 @@ def fetch_store(session: requests.Session, access_token: str, region: str) -> di
     headers["X-Riot-Entitlements-JWT"] = entitlements_token
     headers["X-Riot-ClientVersion"] = get_client_version()
     headers["X-Riot-ClientPlatform"] = CLIENT_PLATFORM
+    return headers, puuid
 
+
+def get_tier_names() -> dict:
+    """Maps competitive tier number -> readable name, e.g. 21 -> 'Immortal 1'."""
+    try:
+        episodes = requests.get(COMPETITIVE_TIERS_URL, timeout=10).json()["data"]
+        # The last episode holds the current tier naming.
+        tiers = episodes[-1]["tiers"]
+        return {t["tier"]: t["tierName"].title() for t in tiers}
+    except Exception:
+        return {}
+
+
+def get_map_names() -> dict:
+    """Maps a map's internal path (mapUrl) -> display name, e.g. Ascent."""
+    try:
+        data = requests.get(MAPS_URL, timeout=10).json()["data"]
+        return {m["mapUrl"]: m["displayName"] for m in data if m.get("mapUrl")}
+    except Exception:
+        return {}
+
+
+def fetch_store(session: requests.Session, access_token: str, region: str) -> dict:
+    """Given a valid access token, fetches entitlements + puuid + the store."""
+    headers, puuid = game_headers(session, access_token)
     # v2 (GET) was deprecated by Riot in favor of v3 (POST).
     store_url = f"https://pd.{region}.a.pvp.net/store/v3/storefront/{puuid}"
     store_resp = session.post(store_url, headers=headers, json={})
     return checked_json(store_resp, "store")
+
+
+def fetch_competitive(
+    session: requests.Session, access_token: str, region: str, count: int = 5
+) -> dict:
+    """Fetches the player's recent competitive updates (rank + RR per match)."""
+    headers, puuid = game_headers(session, access_token)
+    url = (
+        f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitiveupdates"
+        f"?startIndex=0&endIndex={count}&queue=competitive"
+    )
+    return checked_json(session.get(url, headers=headers), "competitive updates")
 
 
 def format_store_lines(store: dict) -> list[str]:
@@ -184,6 +223,32 @@ def format_store_lines(store: dict) -> list[str]:
             item_id = entry["Item"]["ItemID"]
             lines.append(f"- {names.get(item_id.lower(), item_id)} (base price: {entry['BasePrice']})")
 
+    return lines
+
+
+def format_rank_lines(comp: dict, count: int = 5) -> list[str]:
+    """Human-readable current rank + RR result of the last few competitive matches."""
+    matches = comp.get("Matches") or []
+    if not matches:
+        return ["**Competitive**: no ranked matches found (unranked or no recent comp games)."]
+
+    tier_names = get_tier_names()
+    map_names = get_map_names()
+
+    latest = matches[0]
+    tier = latest.get("TierAfterUpdate", 0)
+    rr = latest.get("RankedRatingAfterUpdate", 0)
+    tier_name = tier_names.get(tier, f"Tier {tier}")
+    lines = [f"**Current rank**: {tier_name} — {rr} RR"]
+
+    shown = matches[:count]
+    lines.append(f"\n**Last {len(shown)} competitive matches**:")
+    for m in shown:
+        earned = m.get("RankedRatingEarned", 0)
+        sign = "+" if earned >= 0 else ""
+        result = "won" if earned > 0 else ("lost" if earned < 0 else "draw")
+        map_name = map_names.get(m.get("MapID", ""), m.get("MapID", "Unknown map"))
+        lines.append(f"- {map_name}: {sign}{earned} RR ({result})")
     return lines
 
 
