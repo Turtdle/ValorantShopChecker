@@ -221,21 +221,7 @@ def get_current_act() -> tuple:
     return None, None
 
 
-def season_win_counts(mmr: dict, act_id: str) -> tuple:
-    """Pulls (wins, games) for the given act from an MMR response. (None, None) if absent."""
-    seasonal = (
-        mmr.get("QueueSkills", {})
-        .get("competitive", {})
-        .get("SeasonalInfoBySeasonID", {})
-        or {}
-    )
-    info = seasonal.get(act_id) or {}
-    if "NumberOfGames" not in info:
-        return None, None
-    return info.get("NumberOfWins", 0), info.get("NumberOfGames", 0)
-
-
-def compute_kd(
+def compute_match_stats(
     session: requests.Session,
     headers: dict,
     puuid: str,
@@ -244,17 +230,18 @@ def compute_kd(
     act_start_millis,
     sample: int = 15,
 ) -> dict:
-    """Averages K/D over the player's most recent ranked matches this act.
+    """Winrate + average K/D over the player's most recent ranked matches this act.
 
-    Fetches per-match details (kills/deaths) for up to `sample` games. Returns
-    a dict with kills, deaths, kd, and games actually counted.
+    Fetches per-match details for up to `sample` games and reads both the K/D
+    (from the player's stats) and win/loss (from the player's team) out of the
+    same responses, so both figures cover exactly the same set of games.
     """
     matches = updates.get("Matches") or []
     if act_start_millis:
         matches = [m for m in matches if m.get("MatchStartTime", 0) >= act_start_millis]
     matches = matches[:sample]
 
-    kills = deaths = counted = 0
+    kills = deaths = counted = wins = losses = draws = 0
     for m in matches:
         match_id = m.get("MatchID")
         if not match_id:
@@ -271,23 +258,51 @@ def compute_kd(
         deaths += stats.get("deaths", 0)
         counted += 1
 
+        my_team = next(
+            (t for t in details.get("teams", []) if t.get("teamId") == me.get("teamId")), None
+        )
+        if my_team is None:
+            draws += 1  # can't determine; don't count toward W or L
+        elif my_team.get("won"):
+            wins += 1
+        else:
+            # A team can be non-winning either from a loss or a draw; tell them apart.
+            teams = details.get("teams", [])
+            if len(teams) == 2 and teams[0].get("won") == teams[1].get("won"):
+                draws += 1
+            else:
+                losses += 1
+
     kd = (kills / deaths) if deaths else float(kills)
-    return {"kills": kills, "deaths": deaths, "kd": kd, "games": counted}
+    return {
+        "kills": kills,
+        "deaths": deaths,
+        "kd": kd,
+        "games": counted,
+        "wins": wins,
+        "losses": losses,
+        "draws": draws,
+    }
 
 
-def format_season_stats_lines(wins, games, kd_stats: dict) -> list[str]:
-    """Human-readable winrate + average K/D summary."""
+def format_season_stats_lines(stats: dict) -> list[str]:
+    """Human-readable winrate + average K/D summary over the sampled ranked games."""
     lines = []
-    if games:
-        wr = wins / games * 100
-        lines.append(f"**Season winrate**: {wr:.0f}% ({wins}W / {games - wins}L over {games} ranked games)")
-    else:
-        lines.append("**Season winrate**: no ranked games this act.")
-
-    if kd_stats["games"]:
+    decisive = stats["wins"] + stats["losses"]
+    if decisive:
+        wr = stats["wins"] / decisive * 100
+        draw_note = f", {stats['draws']}D" if stats["draws"] else ""
         lines.append(
-            f"**Avg K/D**: {kd_stats['kd']:.2f} "
-            f"({kd_stats['kills']}K / {kd_stats['deaths']}D over last {kd_stats['games']} ranked games)"
+            f"**Winrate**: {wr:.0f}% ({stats['wins']}W / {stats['losses']}L{draw_note} "
+            f"over last {stats['games']} ranked games)"
+        )
+    else:
+        lines.append("**Winrate**: no ranked match data available.")
+
+    if stats["games"]:
+        lines.append(
+            f"**Avg K/D**: {stats['kd']:.2f} "
+            f"({stats['kills']}K / {stats['deaths']}D over last {stats['games']} ranked games)"
         )
     else:
         lines.append("**Avg K/D**: no ranked match data available.")

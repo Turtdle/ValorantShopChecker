@@ -29,7 +29,7 @@ from valorant_auth import (
     AUTHORIZE_URL,
     AuthError,
     competitive_updates,
-    compute_kd,
+    compute_match_stats,
     extract_access_token,
     format_rank_lines,
     format_season_stats_lines,
@@ -37,8 +37,6 @@ from valorant_auth import (
     game_headers,
     get_current_act,
     login,
-    player_mmr,
-    season_win_counts,
     store_front,
 )
 
@@ -84,11 +82,9 @@ def main():
         updates = competitive_updates(
             session, headers, puuid, args.region, count=max(args.kd_matches, 5)
         )
-        mmr = player_mmr(session, headers, puuid, args.region)
-        act_id, act_start = get_current_act()
-        wins, games = season_win_counts(mmr, act_id) if act_id else (None, None)
-        print("\nSampling recent matches for K/D... (this can take a few seconds)")
-        kd_stats = compute_kd(
+        _, act_start = get_current_act()
+        print("\nSampling recent matches for winrate + K/D... (this can take a few seconds)")
+        stats = compute_match_stats(
             session, headers, puuid, args.region, updates, act_start, sample=args.kd_matches
         )
     except AuthError as e:
@@ -99,7 +95,7 @@ def main():
     print()
     print("\n".join(format_rank_lines(updates)))
     print()
-    print("\n".join(format_season_stats_lines(wins, games, kd_stats)))
+    print("\n".join(format_season_stats_lines(stats)))
 
 
 if __name__ == "__main__":
