@@ -275,6 +275,7 @@ def compute_match_stats(
     fetch (e.g. a rate limit) is retried once with a short backoff, then skipped.
     """
     kills = deaths = counted = wins = losses = draws = 0
+    per_match = []  # one record per counted game, most-recent first
     total = len(matches)
     for i, m in enumerate(matches, 1):
         match_id = m.get("MatchID")
@@ -292,28 +293,61 @@ def compute_match_stats(
                     time.sleep(2)  # brief backoff, likely a transient rate limit
         if details is None:
             continue  # skip a match that keeps erroring rather than aborting
-        me = next((p for p in details.get("players", []) if p.get("subject") == puuid), None)
+        players = details.get("players", [])
+        me = next((p for p in players if p.get("subject") == puuid), None)
         if not me:
             continue
         stats = me.get("stats", {})
-        kills += stats.get("kills", 0)
-        deaths += stats.get("deaths", 0)
+        k = stats.get("kills", 0)
+        d = stats.get("deaths", 0)
+        a = stats.get("assists", 0)
+        kills += k
+        deaths += d
         counted += 1
 
-        my_team = next(
-            (t for t in details.get("teams", []) if t.get("teamId") == me.get("teamId")), None
-        )
+        teams = details.get("teams", [])
+        my_team = next((t for t in teams if t.get("teamId") == me.get("teamId")), None)
         if my_team is None:
-            draws += 1  # can't determine; don't count toward W or L
+            result = "draw"
+            draws += 1
         elif my_team.get("won"):
+            result = "win"
             wins += 1
+        elif len(teams) == 2 and teams[0].get("won") == teams[1].get("won"):
+            result = "draw"
+            draws += 1
         else:
-            # A team can be non-winning either from a loss or a draw; tell them apart.
-            teams = details.get("teams", [])
-            if len(teams) == 2 and teams[0].get("won") == teams[1].get("won"):
-                draws += 1
-            else:
-                losses += 1
+            result = "loss"
+            losses += 1
+
+        my_rounds = my_team.get("roundsWon", 0) if my_team else 0
+        enemy_rounds = max(
+            (t.get("roundsWon", 0) for t in teams if t is not my_team), default=0
+        )
+        rounds_total = sum(t.get("roundsWon", 0) for t in teams) or (my_rounds + enemy_rounds)
+        acs = round(stats.get("score", 0) / rounds_total) if rounds_total else 0
+
+        # Scoreboard placement = rank of this player's combat score among all 10.
+        ranked = sorted(players, key=lambda p: p.get("stats", {}).get("score", 0), reverse=True)
+        placement = next(
+            (idx for idx, p in enumerate(ranked, 1) if p.get("subject") == puuid), 0
+        )
+
+        per_match.append(
+            {
+                "map_id": m.get("MapID", ""),
+                "rr": m.get("RankedRatingEarned", 0),
+                "result": result,
+                "my_rounds": my_rounds,
+                "enemy_rounds": enemy_rounds,
+                "kills": k,
+                "deaths": d,
+                "assists": a,
+                "acs": acs,
+                "placement": placement,
+                "players": len(players),
+            }
+        )
 
     if progress and total:
         print(" " * 40, end="\r")  # clear the progress line
@@ -327,6 +361,7 @@ def compute_match_stats(
         "wins": wins,
         "losses": losses,
         "draws": draws,
+        "per_match": per_match,
     }
 
 
@@ -402,29 +437,48 @@ def format_store_lines(store: dict) -> list[str]:
     return lines
 
 
-def format_rank_lines(comp: dict, count: int = 5) -> list[str]:
-    """Human-readable current rank + RR result of the last few competitive matches."""
+def _ordinal(n: int) -> str:
+    """1 -> '1st', 2 -> '2nd', 11 -> '11th', etc."""
+    if not n:
+        return "?"
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def format_current_rank_line(comp: dict) -> str:
+    """Current rank + RR, from the most recent competitive update."""
     matches = comp.get("Matches") or []
     if not matches:
-        return ["**Competitive**: no ranked matches found (unranked or no recent comp games)."]
-
-    tier_names = get_tier_names()
-    map_names = get_map_names()
-
+        return "**Current rank**: no recent competitive matches found."
     latest = matches[0]
     tier = latest.get("TierAfterUpdate", 0)
     rr = latest.get("RankedRatingAfterUpdate", 0)
-    tier_name = tier_names.get(tier, f"Tier {tier}")
-    lines = [f"**Current rank**: {tier_name} — {rr} RR"]
+    tier_name = get_tier_names().get(tier, f"Tier {tier}")
+    return f"**Current rank**: {tier_name} — {rr} RR"
 
-    shown = matches[:count]
-    lines.append(f"\n**Last {len(shown)} competitive matches**:")
-    for m in shown:
-        earned = m.get("RankedRatingEarned", 0)
-        sign = "+" if earned >= 0 else ""
-        result = "won" if earned > 0 else ("lost" if earned < 0 else "draw")
-        map_name = map_names.get(m.get("MapID", ""), m.get("MapID", "Unknown map"))
-        lines.append(f"- {map_name}: {sign}{earned} RR ({result})")
+
+def format_recent_matches_lines(per_match: list, count: int = 5) -> list[str]:
+    """Detailed readout of the most recent games: result, KDA, ACS, placement, RR."""
+    shown = per_match[:count]
+    if not shown:
+        return ["**Recent matches**: no ranked match data available."]
+
+    map_names = get_map_names()
+    lines = [f"**Last {len(shown)} competitive matches**:"]
+    for rec in shown:
+        map_name = map_names.get(rec["map_id"], rec["map_id"] or "Unknown map")
+        result = {"win": "Win", "loss": "Loss", "draw": "Draw"}.get(rec["result"], "?")
+        rr = rec["rr"]
+        rr_str = f"+{rr}" if rr >= 0 else str(rr)
+        kda = f"{rec['kills']}/{rec['deaths']}/{rec['assists']}"
+        place = _ordinal(rec["placement"])
+        lines.append(
+            f"- {map_name}: {result} {rec['my_rounds']}-{rec['enemy_rounds']} | "
+            f"{kda} KDA | {rec['acs']} ACS | {place} of {rec['players']} | {rr_str} RR"
+        )
     return lines
 
 
