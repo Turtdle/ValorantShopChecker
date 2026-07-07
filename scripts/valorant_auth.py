@@ -4,6 +4,7 @@ Used by check_store.py (interactive), bootstrap_cookies.py (one-time local
 login to seed a reusable session), and ci_check_store.py (unattended,
 cookie-based refresh for the GitHub Action).
 """
+import datetime as _dt
 import re
 from urllib.parse import parse_qs, urlparse
 
@@ -23,6 +24,7 @@ VERSION_URL = "https://valorant-api.com/v1/version"
 SKINLEVELS_URL = "https://valorant-api.com/v1/weapons/skinlevels"
 COMPETITIVE_TIERS_URL = "https://valorant-api.com/v1/competitivetiers"
 MAPS_URL = "https://valorant-api.com/v1/maps"
+SEASONS_URL = "https://valorant-api.com/v1/seasons"
 CLIENT_PLATFORM = (
     "ew0KCSJwbGF0Zm9ybVR5cGUiOiAiUEMiLA0KCSJwbGF0Zm9ybU9TIjogIldpbmRvd3MiLA0KCSJwbGF0Zm9ybU9T"
     "VmVyc2lvbiI6ICIxMC4wLjE5MDQyLjEuMjU2LjY0Yml0IiwNCgkicGxhdGZvcm1DaGlwc2V0IjogIlVua25vd24i"
@@ -171,13 +173,131 @@ def get_map_names() -> dict:
         return {}
 
 
+# --- Low-level game endpoints (take prebuilt headers + puuid, so a caller can
+# --- reuse one auth handshake across several calls) ---
+
+def store_front(session: requests.Session, headers: dict, puuid: str, region: str) -> dict:
+    # v2 (GET) was deprecated by Riot in favor of v3 (POST).
+    store_url = f"https://pd.{region}.a.pvp.net/store/v3/storefront/{puuid}"
+    return checked_json(session.post(store_url, headers=headers, json={}), "store")
+
+
+def competitive_updates(
+    session: requests.Session, headers: dict, puuid: str, region: str, count: int = 5
+) -> dict:
+    url = (
+        f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitiveupdates"
+        f"?startIndex=0&endIndex={count}&queue=competitive"
+    )
+    return checked_json(session.get(url, headers=headers), "competitive updates")
+
+
+def player_mmr(session: requests.Session, headers: dict, puuid: str, region: str) -> dict:
+    url = f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}"
+    return checked_json(session.get(url, headers=headers), "mmr")
+
+
+def match_details(session: requests.Session, headers: dict, region: str, match_id: str) -> dict:
+    url = f"https://pd.{region}.a.pvp.net/match-details/v1/matches/{match_id}"
+    return checked_json(session.get(url, headers=headers, timeout=20), "match details")
+
+
+# --- access_token-based wrappers (used by CI / bootstrap, one call each) ---
+
+def get_current_act() -> tuple:
+    """Returns (act_uuid, act_start_millis) for the currently active act, or (None, None)."""
+    try:
+        seasons = requests.get(SEASONS_URL, timeout=10).json()["data"]
+        now = _dt.datetime.now(_dt.timezone.utc)
+        for s in seasons:
+            start = _dt.datetime.fromisoformat(s["startTime"].replace("Z", "+00:00"))
+            end = _dt.datetime.fromisoformat(s["endTime"].replace("Z", "+00:00"))
+            # Acts have a parent episode; episodes (parentUuid=None) also match the
+            # date window, so require parentUuid to pick the act specifically.
+            if s.get("parentUuid") and start <= now < end:
+                return s["uuid"], int(start.timestamp() * 1000)
+    except Exception:
+        pass
+    return None, None
+
+
+def season_win_counts(mmr: dict, act_id: str) -> tuple:
+    """Pulls (wins, games) for the given act from an MMR response. (None, None) if absent."""
+    seasonal = (
+        mmr.get("QueueSkills", {})
+        .get("competitive", {})
+        .get("SeasonalInfoBySeasonID", {})
+        or {}
+    )
+    info = seasonal.get(act_id) or {}
+    if "NumberOfGames" not in info:
+        return None, None
+    return info.get("NumberOfWins", 0), info.get("NumberOfGames", 0)
+
+
+def compute_kd(
+    session: requests.Session,
+    headers: dict,
+    puuid: str,
+    region: str,
+    updates: dict,
+    act_start_millis,
+    sample: int = 15,
+) -> dict:
+    """Averages K/D over the player's most recent ranked matches this act.
+
+    Fetches per-match details (kills/deaths) for up to `sample` games. Returns
+    a dict with kills, deaths, kd, and games actually counted.
+    """
+    matches = updates.get("Matches") or []
+    if act_start_millis:
+        matches = [m for m in matches if m.get("MatchStartTime", 0) >= act_start_millis]
+    matches = matches[:sample]
+
+    kills = deaths = counted = 0
+    for m in matches:
+        match_id = m.get("MatchID")
+        if not match_id:
+            continue
+        try:
+            details = match_details(session, headers, region, match_id)
+        except AuthError:
+            continue  # skip a match that errors (e.g. rate limit) rather than aborting
+        me = next((p for p in details.get("players", []) if p.get("subject") == puuid), None)
+        if not me:
+            continue
+        stats = me.get("stats", {})
+        kills += stats.get("kills", 0)
+        deaths += stats.get("deaths", 0)
+        counted += 1
+
+    kd = (kills / deaths) if deaths else float(kills)
+    return {"kills": kills, "deaths": deaths, "kd": kd, "games": counted}
+
+
+def format_season_stats_lines(wins, games, kd_stats: dict) -> list[str]:
+    """Human-readable winrate + average K/D summary."""
+    lines = []
+    if games:
+        wr = wins / games * 100
+        lines.append(f"**Season winrate**: {wr:.0f}% ({wins}W / {games - wins}L over {games} ranked games)")
+    else:
+        lines.append("**Season winrate**: no ranked games this act.")
+
+    if kd_stats["games"]:
+        lines.append(
+            f"**Avg K/D**: {kd_stats['kd']:.2f} "
+            f"({kd_stats['kills']}K / {kd_stats['deaths']}D over last {kd_stats['games']} ranked games)"
+        )
+    else:
+        lines.append("**Avg K/D**: no ranked match data available.")
+    return lines
+
+
 def fetch_store(session: requests.Session, access_token: str, region: str) -> dict:
     """Given a valid access token, fetches entitlements + puuid + the store."""
     headers, puuid = game_headers(session, access_token)
-    # v2 (GET) was deprecated by Riot in favor of v3 (POST).
-    store_url = f"https://pd.{region}.a.pvp.net/store/v3/storefront/{puuid}"
-    store_resp = session.post(store_url, headers=headers, json={})
-    return checked_json(store_resp, "store")
+    return store_front(session, headers, puuid, region)
 
 
 def fetch_competitive(
@@ -185,11 +305,7 @@ def fetch_competitive(
 ) -> dict:
     """Fetches the player's recent competitive updates (rank + RR per match)."""
     headers, puuid = game_headers(session, access_token)
-    url = (
-        f"https://pd.{region}.a.pvp.net/mmr/v1/players/{puuid}/competitiveupdates"
-        f"?startIndex=0&endIndex={count}&queue=competitive"
-    )
-    return checked_json(session.get(url, headers=headers), "competitive updates")
+    return competitive_updates(session, headers, puuid, region, count)
 
 
 def format_store_lines(store: dict) -> list[str]:

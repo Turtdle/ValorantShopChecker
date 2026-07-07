@@ -28,12 +28,18 @@ import requests
 from valorant_auth import (
     AUTHORIZE_URL,
     AuthError,
+    competitive_updates,
+    compute_kd,
     extract_access_token,
-    fetch_competitive,
-    fetch_store,
     format_rank_lines,
+    format_season_stats_lines,
     format_store_lines,
+    game_headers,
+    get_current_act,
     login,
+    player_mmr,
+    season_win_counts,
+    store_front,
 )
 
 
@@ -43,6 +49,12 @@ def main():
     parser.add_argument(
         "--url",
         help="Paste the full playvalorant.com/opt_in redirect URL here to skip the prompt.",
+    )
+    parser.add_argument(
+        "--kd-matches",
+        type=int,
+        default=15,
+        help="How many recent ranked matches to sample for the average K/D (default 15).",
     )
     args = parser.parse_args()
 
@@ -64,15 +76,30 @@ def main():
                 password = getpass.getpass("Riot password (hidden): ")
                 access_token = login(session, username, password)
 
-        store = fetch_store(session, access_token, args.region)
-        comp = fetch_competitive(session, access_token, args.region)
+        # One auth handshake, reused across every game endpoint below.
+        headers, puuid = game_headers(session, access_token)
+        store = store_front(session, headers, puuid, args.region)
+
+        # Pull enough recent updates to cover both the rank readout and the K/D sample.
+        updates = competitive_updates(
+            session, headers, puuid, args.region, count=max(args.kd_matches, 5)
+        )
+        mmr = player_mmr(session, headers, puuid, args.region)
+        act_id, act_start = get_current_act()
+        wins, games = season_win_counts(mmr, act_id) if act_id else (None, None)
+        print("\nSampling recent matches for K/D... (this can take a few seconds)")
+        kd_stats = compute_kd(
+            session, headers, puuid, args.region, updates, act_start, sample=args.kd_matches
+        )
     except AuthError as e:
         raise SystemExit(str(e))
 
     print()
     print("\n".join(format_store_lines(store)))
     print()
-    print("\n".join(format_rank_lines(comp)))
+    print("\n".join(format_rank_lines(updates)))
+    print()
+    print("\n".join(format_season_stats_lines(wins, games, kd_stats)))
 
 
 if __name__ == "__main__":
