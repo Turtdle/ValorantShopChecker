@@ -44,6 +44,14 @@ def write_github_output(name: str, value: str) -> None:
         f.write(f"{name}<<{delimiter}\n{value}\n{delimiter}\n")
 
 
+def mask_in_logs(value: str) -> None:
+    # A step output isn't a secret, so the runner would print it in plain text in
+    # the next step's "env:" log header, and this repo's logs are public.
+    # ::add-mask:: tells the runner to replace the value with *** everywhere.
+    if value and os.environ.get("GITHUB_ACTIONS") == "true":
+        print(f"::add-mask::{value}", flush=True)
+
+
 def main():
     cookies_json = (os.environ.get("RIOT_COOKIES") or "").strip()
     webhook_url = (os.environ.get("DISCORD_WEBHOOK_URL") or "").strip()
@@ -97,7 +105,12 @@ def main():
     post_to_discord(webhook_url, "\n".join(format_store_lines(store)))
 
     # Riot may rotate the session cookie on reauth; persist whatever's current.
-    write_github_output("cookies", json.dumps(cookies_to_dict(session)))
+    refreshed = cookies_to_dict(session)
+    refreshed_json = json.dumps(refreshed)
+    mask_in_logs(refreshed_json)
+    for cookie_value in refreshed.values():
+        mask_in_logs(str(cookie_value))
+    write_github_output("cookies", refreshed_json)
 
 
 if __name__ == "__main__":
